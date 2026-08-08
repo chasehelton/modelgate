@@ -33,6 +33,18 @@ spec:
       # K8s SIGKILLs you mid-drain and you drop the requests you were protecting.
       terminationGracePeriodSeconds: 30
 
+      # runAsNonRoot makes the kubelet VERIFY the user isn't root before it
+      # starts the container -- and it can only do that with a NUMERIC uid.
+      # The distroless image declares `USER nonroot:nonroot` (a name), which
+      # the kubelet cannot resolve, so it refuses with CreateContainerConfigError.
+      # 65532 is the numeric uid behind distroless "nonroot".
+      # Learned the hard way: CI caught this on the very first run.
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+
       containers:
         - name: modelgate
           image: modelgate:dev

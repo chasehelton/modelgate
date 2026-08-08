@@ -23,7 +23,8 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: "1.24"
-          cache: true
+          # No cache: this project has zero third-party dependencies, so there
+          # is no go.sum and nothing to restore. Enabling it just logs a warning.
 
       # gofmt as a gate. In Go there is one correct format and it is not a
       # matter of taste, so this can be a hard failure with no bikeshedding.
@@ -84,7 +85,13 @@ jobs:
         if: always()
         run: |
           kubectl get pods -o wide
-          kubectl describe deployment modelgate | tail -20
+          # Events are where K8s tells you in plain English what went wrong
+          # (ImagePullBackOff, Readiness probe failed, CreateContainerConfigError).
+          # Always dump them on failure -- reading `describe` output is the
+          # single most useful K8s debugging skill.
+          kubectl describe pods -l app=modelgate | tail -40
+          kubectl get events --sort-by=.lastTimestamp | tail -20
+          kubectl logs -l app=modelgate --tail=30 --all-containers || true
 
   publish:
     runs-on: ubuntu-latest

@@ -155,6 +155,25 @@ kubectl port-forward svc/modelgate 8080:80
 
 `kubectl describe` → read the **Events** section first. It says `ImagePullBackOff` or `Readiness probe failed` in plain English 90% of the time.
 
+### War story: the first CI run failed, and it's a good one
+
+The very first push had all three pods stuck in `CreateContainerConfigError` and the rollout timed out. Worth understanding because it's a real class of bug, not a typo:
+
+The Dockerfile declares `USER nonroot:nonroot` — a *name*. The Deployment sets `runAsNonRoot: true`, which makes the kubelet **verify the user isn't root before starting the container**. But the kubelet doesn't have the image's `/etc/passwd`, so it cannot resolve the name `nonroot` to a UID, so it can't prove the user isn't root — and it refuses to start rather than risk running as root.
+
+The fix is a numeric UID in the pod's `securityContext`:
+
+```yaml
+securityContext:
+  runAsNonRoot: true
+  runAsUser: 65532     # the numeric uid behind distroless "nonroot"
+```
+
+Three lessons worth carrying into an interview:
+1. **A working `docker run` does not mean a working pod.** The container ran fine locally; K8s applies admission and security constraints Docker never does.
+2. **`CreateContainerConfigError` means the kubelet rejected the config before ever starting the container** — so `kubectl logs` is empty and useless. Go to `kubectl describe` → Events.
+3. **This is exactly why CI runs a real cluster.** A manifest-lint job would have passed this YAML happily. Only actually applying it to a cluster caught it.
+
 ---
 
 ## Part 4 — Containers and CI
