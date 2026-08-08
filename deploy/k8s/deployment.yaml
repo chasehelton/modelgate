@@ -1,0 +1,118 @@
+# Handwritten on purpose. Helm would hide exactly the fields you are here to
+# learn. Read every block -- the comments are the lesson.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: modelgate
+  labels:
+    app: modelgate
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: modelgate
+
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      # With 3 replicas: never drop below 3 ready (surge to 4, then retire one).
+      # maxUnavailable: 0 is what makes the update zero-capacity-loss. Combined
+      # with a correct readinessProbe it is also what makes a BAD deploy stall
+      # instead of taking the service down -- new pods never go ready, so K8s
+      # never retires the old ones. That is the single most valuable K8s
+      # behaviour to understand for this job.
+      maxUnavailable: 0
+      maxSurge: 1
+
+  template:
+    metadata:
+      labels:
+        app: modelgate
+    spec:
+      # Give the process time to drain. Must exceed your Shutdown() timeout, or
+      # K8s SIGKILLs you mid-drain and you drop the requests you were protecting.
+      terminationGracePeriodSeconds: 30
+
+      containers:
+        - name: modelgate
+          image: modelgate:dev
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+
+          env:
+            # Try setting this to 30 and running a rollout. Watch it stall.
+            - name: STARTUP_DELAY_SECONDS
+              value: "3"
+
+          # startupProbe: for slow boots. While it is failing, liveness and
+          # readiness are suspended -- so a slow start is not mistaken for a
+          # hang and restart-looped. failureThreshold * periodSeconds is the
+          # total boot budget (here 30s).
+          startupProbe:
+            httpGet: { path: /readyz, port: http }
+            periodSeconds: 2
+            failureThreshold: 15
+
+          # livenessProbe: "is the process wedged?" Restart is the only cure.
+          # Keep it SHALLOW. If this checked the database, a database blip would
+          # restart every pod at once and turn a degradation into an outage.
+          livenessProbe:
+            httpGet: { path: /livez, port: http }
+            periodSeconds: 10
+            failureThreshold: 3
+
+          # readinessProbe: "should this pod get traffic right now?" Deep check.
+          # Failing this removes the pod from the Service endpoints WITHOUT
+          # killing it -- the pod can recover and rejoin.
+          readinessProbe:
+            httpGet: { path: /readyz, port: http }
+            periodSeconds: 5
+            failureThreshold: 2
+
+          resources:
+            # requests = what the scheduler reserves. limits = the hard cap.
+            # No CPU limit on purpose: CPU limits cause throttling and latency
+            # spikes even when the node is idle. Memory HAS a limit because
+            # memory is incompressible -- exceed it and you get OOMKilled.
+            requests:
+              cpu: 50m
+              memory: 32Mi
+            limits:
+              memory: 128Mi
+
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            capabilities:
+              drop: ["ALL"]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: modelgate
+spec:
+  # A Service is a stable virtual IP + DNS name in front of a changing set of
+  # pods. It finds them by LABEL SELECTOR, not by name. Typo the selector and
+  # you get a Service with zero endpoints and connection refused -- check with
+  # `kubectl get endpoints modelgate`.
+  selector:
+    app: modelgate
+  ports:
+    - port: 80
+      targetPort: http
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: modelgate
+spec:
+  # Protects against VOLUNTARY disruption (node drains, cluster upgrades).
+  # Without this, draining a node can evict all your pods at once even though
+  # your Deployment strategy is careful.
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app: modelgate

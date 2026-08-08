@@ -1,0 +1,123 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# Least privilege by default. The publish job re-grants only what it needs.
+permissions:
+  contents: read
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+          cache: true
+
+      # gofmt as a gate. In Go there is one correct format and it is not a
+      # matter of taste, so this can be a hard failure with no bikeshedding.
+      - name: Check formatting
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "These files are not gofmt'd:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: Vet
+        run: go vet ./...
+
+      # The race detector needs an amd64 runner -- it cannot run on the author's
+      # arm64 Raspberry Pi (ThreadSanitizer "unsupported VMA range"). This is a
+      # good example of CI covering a gap in the local dev environment.
+      - name: Test with race detector
+        run: go test -race -count=1 ./...
+
+      - name: Build
+        run: go build ./...
+
+  # Real end-to-end check: build the image, run it in a kind cluster, apply the
+  # manifests, and assert the rollout converges and the API answers. This is
+  # what stops the manifests from silently rotting.
+  k8s-smoke:
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Create kind cluster
+        uses: helm/kind-action@v1
+        with:
+          cluster_name: modelgate
+
+      - name: Build image
+        run: docker build -t modelgate:ci .
+
+      - name: Load image into kind
+        run: kind load docker-image modelgate:ci --name modelgate
+
+      - name: Deploy
+        run: |
+          sed 's|image: modelgate:dev|image: modelgate:ci|' deploy/k8s/deployment.yaml | kubectl apply -f -
+
+      - name: Wait for rollout
+        run: kubectl rollout status deployment/modelgate --timeout=120s
+
+      - name: Smoke test the API through the Service
+        run: |
+          kubectl run curl --image=curlimages/curl:8.10.1 --restart=Never --rm -i --quiet -- \
+            curl -sf "http://modelgate.default.svc.cluster.local/v1/assignment?client_id=ci-test"
+
+      - name: Show rollout history
+        if: always()
+        run: |
+          kubectl get pods -o wide
+          kubectl describe deployment modelgate | tail -20
+
+  publish:
+    runs-on: ubuntu-latest
+    needs: [test, k8s-smoke]
+    if: github.ref == 'refs/heads/main'
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          # GITHUB_TOKEN is minted per-run and expires. No long-lived secret.
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/metadata-action@v5
+        id: meta
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          # Tag with the commit SHA, not just :latest. Immutable tags are what
+          # make a rollback a precise operation instead of a guess.
+          tags: |
+            type=sha,format=long
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
